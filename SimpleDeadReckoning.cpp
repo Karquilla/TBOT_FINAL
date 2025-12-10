@@ -36,8 +36,8 @@ SimpleDeadReckoning::SimpleDeadReckoning(float argEncoderValuePer360Rotation, fl
 
 SimpleDeadReckoning::SimpleDeadReckoning(){   // defalut
   _eValue = (360.0/122.0) * (3.141592 / 180.0) ;    // click per 360/122 degree
-  _wRadius = 3.39;  //  2*r = 6.78;
-  _wDistance = 15.5;  // 15.5 cm between two wheels
+  _wRadius = 0.6;  //  2*r = 6.78;
+  _wDistance = 5.8;  // 15.5 cm between two wheels
   _unit = 0;        // Metric (cm) unit 
 }
 

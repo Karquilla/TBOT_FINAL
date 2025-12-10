@@ -43,8 +43,8 @@ public:
 
 private:
   float _eValue = 122.0;
-  float _wDistance = 15.5;
-  float _wRadius = 3.39;
+  float _wDistance = 5.8;
+  float _wRadius = 0.6;
   int   _unit = 0;
   float _theta = 0.0;
   float _leftOdom = 0;
