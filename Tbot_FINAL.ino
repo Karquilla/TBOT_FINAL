@@ -374,70 +374,57 @@ void lineFollowStep() {
   const int   ERR_SIGN      = -1;
 
   // Threshold for "sensor sees line" (tune this based on your readings)
-  const int   IR_ON_THRESH  = 1800;
+  const int   IR_ON_THRESH  = 1000;
 
   // Opposite snap tuning
-  const int   SNAP_MAG      = 400;       // size of opposite snap in PWM units
-                                         // (bump to 200 if you want more kick)
+  const float SNAP_GAIN     = 0.7f;      // how much of -u_at_off to apply (0.5–0.8)
+  const float SNAP_CLAMP    = 250.0f;    // max snap magnitude in PWM units
 
-  static bool  lastBothOn = false;
-  static int   lastDir    = 0;           // +1 = steering one way, -1 = the other
+  static bool  wasOff   = false;        // were we fully off last step?
+  static float u_at_off = 0.0f;         // steering when we went off
 
   // ===== Read IR sensors =====
   int Rraw = adc1_get_raw(ADC1_CHANNEL_1);  // right IR
   int Lraw = adc1_get_raw(ADC1_CHANNEL_4);  // left IR
 
-  bool leftOn  = (Lraw > IR_ON_THRESH);
-  bool rightOn = (Rraw > IR_ON_THRESH);
-  bool bothOn  = leftOn && rightOn;
+  bool leftOn   = (Lraw > IR_ON_THRESH);
+  bool rightOn  = (Rraw > IR_ON_THRESH);
+  bool anyOn    = leftOn || rightOn;
+  bool offNow   = !anyOn;                 // OFF = both sensors NOT seeing tape
+  bool backOnNow = anyOn;                 // BACK ON = at least one sees tape
 
-  float u = 0.0f;  // steering term
+  // ===== Base P-control steering (always computed) =====
+  float e = (float)(Rraw - Lraw) / SCALE;  // right - left
+  e *= (float)ERR_SIGN;
+  if (fabs(e) < DEADBAND) e = 0.0f;
 
-  if (!bothOn) {
-    // ================================================
-    // Normal edge-follow P control (one-sensor region)
-    // ================================================
-    float e = (float)(Rraw - Lraw) / SCALE;  // right - left
-    e *= (float)ERR_SIGN;
-    if (fabs(e) < DEADBAND) e = 0.0f;
+  float u = KP * e;
 
-    u = KP * e;
+  // Clamp u for normal control
+  float headroom = (float)(PWM_MAX - BASE);
+  if (u >  headroom) u =  headroom;
+  if (u < -headroom) u = -headroom;
 
-    // Clamp u so BASE ± u stays within [0, PWM_MAX]
-    float headroom = (float)(PWM_MAX - BASE);
-    if (u >  headroom) u =  headroom;
-    if (u < -headroom) u = -headroom;
-
-    // Track steering direction based on u
-    if (u > 0.0f)      lastDir = +1;
-    else if (u < 0.0f) lastDir = -1;
-    // if u == 0, keep lastDir as-is
-
-  } else {
-    // ================================================
-    // Both sensors see the line
-    // ================================================
-    if (!lastBothOn && bothOn) {
-      // Rising edge: we *just* got back on the line
-      // → apply a single opposite snap of the previous steering
-
-      if (lastDir > 0) {
-        // we had been steering in + direction → snap in - direction
-        u = -SNAP_MAG;
-      } else if (lastDir < 0) {
-        // we had been steering in - direction → snap in + direction
-        u = +SNAP_MAG;
-      } else {
-        // no good history, just go straight
-        u = 0.0f;
-      }
-    } else {
-      // Already on the line after the snap → go straight
-      u = 0.0f;
-    }
+  // ===== Detect OFF event =====
+  if (!wasOff && offNow) {
+    // we just went OFF the line → remember steering
+    u_at_off = u;
   }
 
-  lastBothOn = bothOn;
+  // ===== Detect BACK-ON event and apply opposite snap =====
+  if (wasOff && backOnNow) {
+    // we were OFF last step, now at least one sensor is back ON
+    float snap = -u_at_off * SNAP_GAIN;
+
+    // clamp snap so it doesn’t go crazy
+    if (snap >  SNAP_CLAMP) snap =  SNAP_CLAMP;
+    if (snap < -SNAP_CLAMP) snap = -SNAP_CLAMP;
+
+    u = snap;   // override steering for this one step
+  }
+
+  // update off/on memory
+  wasOff = offNow;
 
   // ===== Convert steering term to wheel PWMs =====
   int pwmLeft  = (int)(BASE + u);
