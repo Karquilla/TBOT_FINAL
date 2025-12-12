@@ -1,8 +1,10 @@
 // ==========================================================
-//  TB Final Project - All Tasks 1–7
-//  Hardware + low-level from Lab A/B
-//  Manual mode (Task 6/7) updated so L/R make CURVED motion
-//  Task 2: encoder-based 40cm sides + IMU-based 90deg turns
+//  TB Final Project - All Tasks 1–7 (NO SimpleDeadReckoning)
+//  - Encoders give distance (2πR * ticks / ticks_per_rev)
+//  - MPU6050_light gives heading (yaw)
+//  - We integrate x,y ourselves from distance + heading
+//  - Q2: 40cm square forward
+//  - Q3: 40cm square forward + 40cm square backward (IMU PID)
 //  Kyle Arquilla
 // ==========================================================
 
@@ -13,10 +15,9 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_VL53L0X.h>
-#include "MPU6050.h"
-#include "SimpleDeadReckoning.h"
-#include <math.h>
+#include <MPU6050_light.h>
 #include <driver/adc.h>
+#include <math.h>
 
 // ==========================================================
 //  PIN DEFINES (from Lab A/B)
@@ -68,151 +69,21 @@ void oledPrint(const String lines[], int count) {
   display.setCursor(0, 0);
 
   for (int i = 0; i < count; i++) {
-    display.println(lines[i]);   // supports \n inside
+    display.println(lines[i]);
   }
-
   display.display();
 }
 
 // ==========================================================
-//  Motor PWM (LEDC) – from Lab B
+//  Motor PWM (LEDC)
 // ==========================================================
 const int pwmFreq       = 500;
-const int pwmResolution = 10;
+const int pwmResolution = 10;  // 0..1023
 const int pwmA1_Ch      = 0;
 const int pwmA2_Ch      = 1;
 const int pwmB1_Ch      = 2;
 const int pwmB2_Ch      = 3;
 
-// ==========================================================
-//  Encoder & Dead Reckoning – from Lab B
-// ==========================================================
-volatile long encoderCountA = 0;
-volatile long encoderCountB = 0;
-volatile uint8_t prevStateA = 0, prevStateB = 0;
-
-const int   ticksPerRev = 12 * 4;
-const float gearRatio   = 30.0;
-
-// NOTE: using 1.0 (cm) radius and 5.5 (cm) wheel distance => odom in cm
-SimpleDeadReckoning odom(ticksPerRev * gearRatio, 0.6f, 8.0f);
-
-// Quad encoder macros
-#define READ_ENC_A() ((digitalRead(MEA1) << 1) | digitalRead(MEA2))
-#define READ_ENC_B() ((digitalRead(MEB1) << 1) | digitalRead(MEB2))
-
-// ==========================================================
-//  Wi-Fi / UDP
-// ==========================================================
-const char* ssid     = "Pretty fly or A WIFI";
-const char* password = "Spooky091993";
-
-WiFiUDP udp;
-const int UDP_PORT = 9000;
-char incomingBuf[64];
-
-IPAddress pcIP;
-uint16_t pcPort = 0;
-String lastCmd  = "";
-
-// Pose + lidar send
-void sendPoseUDP(float x, float y, float thetaDeg) {
-  if (pcPort == 0) return;
-  String msg = "P," + String(x, 3) + "," + String(y, 3) + "," + String(thetaDeg, 3);
-  udp.beginPacket(pcIP, pcPort);
-  udp.print(msg);
-  udp.endPacket();
-}
-
-void sendLidarUDP(float xw, float yw) {
-  if (pcPort == 0) return;
-  String msg = "L," + String(xw, 3) + "," + String(yw, 3);
-  udp.beginPacket(pcIP, pcPort);
-  udp.print(msg);
-  udp.endPacket();
-}
-
-// ==========================================================
-//  IMU + Lidar
-// ==========================================================
-MPU6050 imu;
-Adafruit_VL53L0X lox;
-
-// ==========================================================
-//  IMU yaw integration (gyro Z) for 90° turns
-// ==========================================================
-float imuYawDeg   = 0.0f;
-float gyroZBias   = 0.0f;
-bool  imuYawReady = false;
-unsigned long imuLastMs = 0;
-
-// Simple bias calibration at rest (call once in setup)
-void calibrateGyroZ(int samples = 500) {
-  int16_t ax, ay, az, gx, gy, gz;
-  long sum = 0;
-  for (int i = 0; i < samples; i++) {
-    imu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-    sum += gz;
-    delay(2);
-  }
-  gyroZBias = (float)sum / (float)samples;
-}
-
-// Reset yaw integration to 0°
-void resetIMUYaw() {
-  imuYawDeg   = 0.0f;
-  imuYawReady = false;
-}
-
-// Update yaw integration; call frequently while turning
-void updateIMUYaw() {
-  int16_t ax, ay, az, gx, gy, gz;
-  imu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-
-  unsigned long now = millis();
-  if (!imuYawReady) {
-    imuLastMs   = now;
-    imuYawReady = true;
-    return;
-  }
-
-  float dt = (now - imuLastMs) / 1000.0f;
-  imuLastMs = now;
-
-  // Assuming default ±250 dps: 131 LSB/(deg/s)
-  float gz_dps = ((float)gz - gyroZBias) / 131.0f;
-
-  imuYawDeg += gz_dps * dt;
-
-  // Optional wrap; not strictly needed for single 90° turn
-  if (imuYawDeg > 180.0f)  imuYawDeg -= 360.0f;
-  if (imuYawDeg < -180.0f) imuYawDeg += 360.0f;
-}
-
-// ==========================================================
-//  Motion LEDs
-// ==========================================================
-void updateMotionLEDs(bool moving) {
-  static unsigned long lastToggle = 0;
-  static bool ledState = false;
-  unsigned long now = millis();
-
-  if (moving) {
-    if (now - lastToggle >= 200UL) {
-      lastToggle = now;
-      ledState = !ledState;
-      digitalWrite(LED1, ledState);
-      digitalWrite(LED2, ledState);
-    }
-  } else {
-    digitalWrite(LED1, HIGH);
-    digitalWrite(LED2, HIGH);
-  }
-}
-
-// ==========================================================
-//  Motor helpers
-// ==========================================================
 void setupMotorPWM() {
   ledcSetup(pwmA1_Ch, pwmFreq, pwmResolution);
   ledcSetup(pwmA2_Ch, pwmFreq, pwmResolution);
@@ -250,12 +121,45 @@ void setMotorB(int pwm) {
 void stopMotors() {
   setMotorA(0);
   setMotorB(0);
-  updateMotionLEDs(false);
 }
 
 // ==========================================================
-//  Encoders – ISRs
+//  Motion LEDs
 // ==========================================================
+void updateMotionLEDs(bool moving) {
+  static unsigned long lastToggle = 0;
+  static bool ledState = false;
+  unsigned long now = millis();
+
+  if (moving) {
+    if (now - lastToggle >= 200UL) {
+      lastToggle = now;
+      ledState = !ledState;
+      digitalWrite(LED1, ledState);
+      digitalWrite(LED2, ledState);
+    }
+  } else {
+    digitalWrite(LED1, HIGH);
+    digitalWrite(LED2, HIGH);
+  }
+}
+
+// ==========================================================
+//  Encoder & Odom
+// ==========================================================
+volatile long encoderCountA = 0;   // left
+volatile long encoderCountB = 0;   // right
+volatile uint8_t prevStateA = 0, prevStateB = 0;
+
+const int   ticksPerRev    = 12 * 4;   // 48 ticks per motor shaft
+const float gearRatio      = 30.0f;    // 30:1
+const float TICKS_PER_REV  = (float)(ticksPerRev * gearRatio); // 1440
+const float WHEEL_RADIUS_CM = 0.6f;    // you had this; distance math matches
+
+// Quad encoder macros
+#define READ_ENC_A() ((digitalRead(MEA1) << 1) | digitalRead(MEA2))
+#define READ_ENC_B() ((digitalRead(MEB1) << 1) | digitalRead(MEB2))
+
 void IRAM_ATTR handleEncoderA() {
   uint8_t state = READ_ENC_A();
   uint8_t combo = (prevStateA << 2) | state;
@@ -306,10 +210,23 @@ void setupEncoderInterrupt() {
 }
 
 // ==========================================================
-//  Odometry + Velocity
+//  Global Pose (x, y, theta) + velocity
+//  Units: cm and degrees
 // ==========================================================
-float robotV = 0.0f;   // "cm/s" with current odom config
-float robotW = 0.0f;   // deg/s
+float poseX_cm   = 0.0f;
+float poseY_cm   = 0.0f;
+float poseTh_deg = 0.0f;   // yaw from IMU
+
+long prevEncA = 0;
+long prevEncB = 0;
+
+float robotV = 0.0f;       // cm/s
+float robotW = 0.0f;       // deg/s
+
+unsigned long lastOdomMs = 0;
+float lastOdomX = 0.0f;
+float lastOdomY = 0.0f;
+float lastOdomTh = 0.0f;
 
 float angleDiffDeg(float a, float b) {
   float d = a - b;
@@ -318,136 +235,324 @@ float angleDiffDeg(float a, float b) {
   return d;
 }
 
+// forward decl for heading
+float getHeadingDeg();
+
+// integrate encoders + IMU heading
 void updateOdometryAndVelocity() {
-  static unsigned long lastT = 0;
-  static float lastX = 0, lastY = 0, lastTh = 0;
-
-  float leftTicks  = -(float)encoderCountA;  // A negative forward
-  float rightTicks =  (float)encoderCountB;  // B positive forward
-
-  float headingDeg = 0.0f;                   // same as Lab B Q2
-  odom.updateLocation(leftTicks, rightTicks, headingDeg);
-
   unsigned long now = millis();
-  if (lastT == 0) {
-    lastT = now;
-    lastX = odom.getXLocation();
-    lastY = odom.getYLocation();
-    lastTh = odom.getTheta();
-    robotV = 0;
-    robotW = 0;
+
+  // encoder deltas
+  long eA = encoderCountA;
+  long eB = encoderCountB;
+  long dA = eA - prevEncA;
+  long dB = eB - prevEncB;
+  prevEncA = eA;
+  prevEncB = eB;
+
+  // same sign convention as your old code:
+  // left forward = negative, right forward = positive
+  float leftTicksDelta  = -(float)dA;
+  float rightTicksDelta =  (float)dB;
+
+  // linear distance this step (cm)
+  float avgTicks = 0.5f * (leftTicksDelta + rightTicksDelta);
+  float deltaS   = avgTicks * (2.0f * PI * WHEEL_RADIUS_CM / TICKS_PER_REV);
+
+  // heading from IMU (deg)
+  poseTh_deg = getHeadingDeg();
+  float thRad = poseTh_deg * PI / 180.0f;
+
+  // update x,y
+  poseX_cm += deltaS * cosf(thRad);
+  poseY_cm += deltaS * sinf(thRad);
+
+  // velocity
+  if (lastOdomMs == 0) {
+    lastOdomMs = now;
+    lastOdomX  = poseX_cm;
+    lastOdomY  = poseY_cm;
+    lastOdomTh = poseTh_deg;
+    robotV = 0.0f;
+    robotW = 0.0f;
     return;
   }
 
-  float dt = (now - lastT) / 1000.0f;
+  float dt = (now - lastOdomMs) / 1000.0f;
   if (dt <= 0) return;
 
-  float x  = odom.getXLocation();  // cm
-  float y  = odom.getYLocation();  // cm
-  float th = odom.getTheta();      // deg
+  float dx  = poseX_cm   - lastOdomX;
+  float dy  = poseY_cm   - lastOdomY;
+  float dth = angleDiffDeg(poseTh_deg, lastOdomTh);
 
-  float dx  = x - lastX;
-  float dy  = y - lastY;
-  float dth = angleDiffDeg(th, lastTh);
-
-  robotV = sqrtf(dx * dx + dy * dy) / dt;  // cm/s with current config
+  robotV = sqrtf(dx * dx + dy * dy) / dt;
   robotW = dth / dt;
 
-  lastX = x; lastY = y; lastTh = th; lastT = now;
+  lastOdomMs = now;
+  lastOdomX  = poseX_cm;
+  lastOdomY  = poseY_cm;
+  lastOdomTh = poseTh_deg;
 }
 
 float distanceFrom(float x0, float y0) {
-  float x = odom.getXLocation();
-  float y = odom.getYLocation();
-  float dx = x - x0;
-  float dy = y - y0;
-  return sqrtf(dx * dx + dy * dy);   // cm with current config
+  float dx = poseX_cm - x0;
+  float dy = poseY_cm - y0;
+  return sqrtf(dx * dx + dy * dy);
+}
+
+// ==========================================================
+//  Wi-Fi / UDP
+// ==========================================================
+const char* ssid     = "Pretty fly or A WIFI";
+const char* password = "Spooky091993";
+
+WiFiUDP udp;
+const int UDP_PORT = 9000;
+char incomingBuf[64];
+
+IPAddress pcIP;
+uint16_t pcPort = 0;
+String lastCmd  = "";
+
+void sendPoseUDP(float x_cm, float y_cm, float theta_deg) {
+  if (pcPort == 0) return;
+  String msg = "P," + String(x_cm, 3) + "," + String(y_cm, 3) + "," + String(theta_deg, 3);
+  udp.beginPacket(pcIP, pcPort);
+  udp.print(msg);
+  udp.endPacket();
+}
+
+void sendLidarUDP(float xw_cm, float yw_cm) {
+  if (pcPort == 0) return;
+  String msg = "L," + String(xw_cm, 3) + "," + String(yw_cm, 3);
+  udp.beginPacket(pcIP, pcPort);
+  udp.print(msg);
+  udp.endPacket();
+}
+
+// ==========================================================
+//  IMU + Lidar
+// ==========================================================
+MPU6050 mpu(Wire);
+Adafruit_VL53L0X lox;
+
+void initIMU() {
+  // Wire.begin(...) is called in setup with custom pins
+  byte status = mpu.begin();
+  Serial.print(F("MPU6050 status: "));
+  Serial.println(status);
+  while (status != 0) {
+    // stuck if IMU not found
+  }
+
+  Serial.println(F("Calculating offsets, do not move MPU6050"));
+  delay(1000);
+  // mpu.upsideDownMounting = true; // if needed
+  mpu.calcOffsets(); // gyro + accel
+  Serial.println(F("IMU offsets done"));
+}
+
+float getHeadingDeg() {
+  // yaw from MPU6050_light
+  return mpu.getAngleZ();
+}
+
+// ==========================================================
+//  Heading PID
+// ==========================================================
+float headingTargetDeg = 0.0f;
+float hErrInt          = 0.0f;
+float hErrPrev         = 0.0f;
+
+// tune these
+float Kp_heading = 6.0f;
+float Ki_heading = 0.02f; 
+float Kd_heading = 0.5f;
+
+void resetHeadingPID(float targetDeg) {
+  headingTargetDeg = targetDeg;
+  hErrInt          = 0.0f;
+  hErrPrev         = 0.0f;
+}
+
+// basePWM > 0 => forward, basePWM < 0 => backward
+void headingHoldStep(int basePWM) {
+  float heading = getHeadingDeg();
+
+  float err = angleDiffDeg(headingTargetDeg, heading);  // wrap [-180,180]
+
+  hErrInt += err;
+  float d  = err - hErrPrev;
+  hErrPrev = err;
+
+  float u = Kp_heading * err + Ki_heading * hErrInt + Kd_heading * d;
+
+  u = -u;
+
+  int leftPWM  = basePWM - (int)u;
+  int rightPWM = basePWM + (int)u;
+
+  leftPWM  = constrain(leftPWM,  -1000, 1000);
+  rightPWM = constrain(rightPWM, -1000, 1000);
+
+  setMotorA(leftPWM);
+  setMotorB(rightPWM);
+}
+
+// basePWM < 0 => backward with heading hold (for Q3 reverse legs)
+void headingHoldStepReverse(int basePWM) {
+  float heading = getHeadingDeg();
+
+  float err = angleDiffDeg(headingTargetDeg, heading);  // wrap [-180,180]
+
+  hErrInt += err;
+  float d  = err - hErrPrev;
+  hErrPrev = err;
+
+  // standard PID term
+  float u = Kp_heading * err + Ki_heading * hErrInt + Kd_heading * d;
+
+  // For reverse, flip the steering compared to the forward case
+  int leftPWM  = basePWM + (int)u;
+  int rightPWM = basePWM - (int)u;
+
+  leftPWM  = constrain(leftPWM,  -1000, 1000);
+  rightPWM = constrain(rightPWM, -1000, 1000);
+
+  setMotorA(leftPWM);
+  setMotorB(rightPWM);
 }
 
 void lineFollowStep() {
-  const int   PWM_MAX       = 1000;
-  const int   PWM_MOVE_MIN  = 150;       // below this, motor basically doesn't move
-  const int   BASE          = 300;
-  const float KP            = 4000.0f;   // strong correction (your value)
-  const float SCALE         = 4000.0f;
-  const float DEADBAND      = 0.03f;
-  const int   ERR_SIGN      = -1;
+  const int FWD_PWM      = 200;   // normal forward speed
+  const int TURN_PWM     = 250;   // normal turn speed on edge
+  const int SEARCH_FWD   = 100;   // inner wheel in search arc
+  const int SEARCH_TURN  = 300;   // outer wheel in search arc
+  const int PWM_MOVE_MIN = 100;
+  const int ADC_MAX      = 4095;
+  const int IR_ON_THRESH = 2700;  // tune between floor and black (after inversion)
 
-  // Threshold for "sensor sees line" (tune this based on your readings)
-  const int   IR_ON_THRESH  = 1000;
+  const unsigned long SEARCH_PIVOT_MS = 300;  // hold inner wheel for 0.5s
 
-  // Opposite snap tuning
-  const float SNAP_GAIN     = 0.7f;      // how much of -u_at_off to apply (0.5–0.8)
-  const float SNAP_CLAMP    = 250.0f;    // max snap magnitude in PWM units
-
-  static bool  wasOff   = false;        // were we fully off last step?
-  static float u_at_off = 0.0f;         // steering when we went off
+  // lost == true → we are in "search" mode
+  static bool  lost         = false;
+  // lastDir: -1 = last correction was "turn left", +1 = "turn right", 0 = straight / unknown
+  static int   lastDir      = 0;
+  // searchPhase: 0 = none, 1 = pivot (inner=0), 2 = creeping arc
+  static int   searchPhase  = 0;
+  static unsigned long phaseStartMs = 0;
 
   // ===== Read IR sensors =====
   int Rraw = adc1_get_raw(ADC1_CHANNEL_1);  // right IR
-  int Lraw = adc1_get_raw(ADC1_CHANNEL_4);  // left IR
+  int Lraw = adc1_get_raw(ADC1_CHANNEL_4);  // left  IR
+
+  // BLACK line → invert so dark = big
+  Rraw = ADC_MAX - Rraw;
+  Lraw = ADC_MAX - Lraw;
 
   bool leftOn   = (Lraw > IR_ON_THRESH);
   bool rightOn  = (Rraw > IR_ON_THRESH);
+  bool bothOn   = leftOn && rightOn;
   bool anyOn    = leftOn || rightOn;
-  bool offNow   = !anyOn;                 // OFF = both sensors NOT seeing tape
-  bool backOnNow = anyOn;                 // BACK ON = at least one sees tape
+  bool bothOff  = !anyOn;
 
-  // ===== Base P-control steering (always computed) =====
-  float e = (float)(Rraw - Lraw) / SCALE;  // right - left
-  e *= (float)ERR_SIGN;
-  if (fabs(e) < DEADBAND) e = 0.0f;
+  int pwmLeft  = 0;
+  int pwmRight = 0;
 
-  float u = KP * e;
+  // ==========================
+  // NORMAL FOLLOWING (not lost)
+  // ==========================
+  if (!lost) {
+    searchPhase = 0;  // not in search when we're on the line
 
-  // Clamp u for normal control
-  float headroom = (float)(PWM_MAX - BASE);
-  if (u >  headroom) u =  headroom;
-  if (u < -headroom) u = -headroom;
-
-  // ===== Detect OFF event =====
-  if (!wasOff && offNow) {
-    // we just went OFF the line → remember steering
-    u_at_off = u;
+    if (bothOff) {
+      // FIRST time we lose the line → mark lost and start search phase 1
+      lost         = true;
+      searchPhase  = 1;
+      phaseStartMs = millis();
+      if (lastDir == 0) {
+        // default search direction if we have no history
+        lastDir = +1;
+      }
+    } else {
+      // We still see the line somewhere → standard 2-sensor behavior
+      if (leftOn && rightOn) {
+        // centered on black → go straight
+        pwmLeft  = FWD_PWM;
+        pwmRight = FWD_PWM;
+        lastDir  = 0;
+      } else if (leftOn && !rightOn) {
+        // line under LEFT sensor → "turn RIGHT"
+        pwmLeft  = TURN_PWM;
+        pwmRight = 0;
+        lastDir  = +1;
+      } else if (!leftOn && rightOn) {
+        // line under RIGHT sensor → "turn LEFT"
+        pwmLeft  = 0;
+        pwmRight = TURN_PWM;
+        lastDir  = -1;
+      }
+    }
   }
 
-  // ===== Detect BACK-ON event and apply opposite snap =====
-  if (wasOff && backOnNow) {
-    // we were OFF last step, now at least one sensor is back ON
-    float snap = -u_at_off * SNAP_GAIN;
+  // ==========================
+  // SEARCH MODE (lost == true)
+  // ==========================
+  if (lost) {
+    unsigned long now = millis();
 
-    // clamp snap so it doesn’t go crazy
-    if (snap >  SNAP_CLAMP) snap =  SNAP_CLAMP;
-    if (snap < -SNAP_CLAMP) snap = -SNAP_CLAMP;
+    if (anyOn) {
+      // We SEE the line again (doesn't matter which sensor) →
+      // exit search and drive straight a bit.
+      lost        = false;
+      searchPhase = 0;
+      pwmLeft     = FWD_PWM;
+      pwmRight    = FWD_PWM;
+      lastDir     = 0;
+    } else {
+      // Still lost → 2-phase behavior:
+      if (searchPhase == 1) {
+        // ---- PHASE 1: pivot in place, inner wheel held at 0 ----
+        if (lastDir <= 0) {
+          // search LEFT: left = inner (0), right = outer
+          pwmLeft  = 0;
+          pwmRight = SEARCH_TURN;
+        } else {
+          // search RIGHT: right = inner (0), left = outer
+          pwmLeft  = SEARCH_TURN;
+          pwmRight = 0;
+        }
 
-    u = snap;   // override steering for this one step
+        if (now - phaseStartMs >= SEARCH_PIVOT_MS) {
+          // after 0.5s, move to creeping arc
+          searchPhase  = 2;
+          phaseStartMs = now;
+        }
+      } else {
+        // ---- PHASE 2: creeping forward arc ----
+        if (lastDir <= 0) {
+          // arc LEFT: left = inner (slow), right = outer (fast)
+          pwmLeft  = SEARCH_FWD;
+          pwmRight = SEARCH_TURN;
+        } else {
+          // arc RIGHT: right = inner (slow), left = outer (fast)
+          pwmLeft  = SEARCH_TURN;
+          pwmRight = SEARCH_FWD;
+        }
+      }
+    }
   }
 
-  // update off/on memory
-  wasOff = offNow;
-
-  // ===== Convert steering term to wheel PWMs =====
-  int pwmLeft  = (int)(BASE + u);
-  int pwmRight = (int)(BASE - u);
-
-  // clamp to [0, PWM_MAX]
-  if (pwmLeft  > PWM_MAX) pwmLeft  = PWM_MAX;
-  if (pwmRight > PWM_MAX) pwmRight = PWM_MAX;
-
-  // never reverse in this task
-  if (pwmLeft  < 0) pwmLeft  = 0;
-  if (pwmRight < 0) pwmRight = 0;
-
-  // tiny positive values that don't really move the wheel → 0
-  if (pwmLeft  > 0 && pwmLeft  < PWM_MOVE_MIN) pwmLeft  = 0;
+  // ==========================
+  // Deadband & apply
+  // ==========================
+  if (pwmLeft  > 0 && pwmLeft  < PWM_MOVE_MIN)  pwmLeft  = 0;
   if (pwmRight > 0 && pwmRight < PWM_MOVE_MIN) pwmRight = 0;
 
   setMotorA(pwmLeft);
   setMotorB(pwmRight);
-  updateMotionLEDs(true);
+  updateMotionLEDs(pwmLeft != 0 || pwmRight != 0);
 }
-
-
 
 // ==========================================================
 //  Modes / Tasks
@@ -466,7 +571,7 @@ enum Mode {
 Mode mode = IDLE;
 
 // ==========================================================
-//  UDP command handler (includes UPDATED manual behavior)
+//  UDP command handler (+ manual control for Task 6/7)
 // ==========================================================
 void handleNetwork() {
   int packetSize = udp.parsePacket();
@@ -483,6 +588,7 @@ void handleNetwork() {
   pcPort = udp.remotePort();
   lastCmd = msg;
 
+  // ===== Task selection (same as before) =====
   if      (msg == "1") mode = TASK1;
   else if (msg == "2") mode = TASK2;
   else if (msg == "3") mode = TASK3;
@@ -491,84 +597,84 @@ void handleNetwork() {
   else if (msg == "6") mode = TASK6;
   else if (msg == "7") mode = TASK7;
 
-  // ===== Manual control (Task 6 & 7) with CURVED motion =====
+  // ===== Manual / PC control (Task 6 & 7) =====
   if (mode == TASK6 || mode == TASK7) {
+    // First, handle M,left,right commands from the Python client
+    if (msg.startsWith("M,")) {
+      int c1 = msg.indexOf(',');          // first comma after 'M'
+      int c2 = msg.indexOf(',', c1 + 1);  // second comma
+
+      if (c1 > 0 && c2 > c1) {
+        int leftPWM  = msg.substring(c1 + 1, c2).toInt();
+        int rightPWM = msg.substring(c2 + 1).toInt();
+
+        // Apply PWM directly to motors
+        setMotorA(leftPWM);
+        setMotorB(rightPWM);
+
+        bool moving = (leftPWM != 0 || rightPWM != 0);
+        updateMotionLEDs(moving);
+      }
+
+      // We handled this packet completely; don't fall through
+      return;
+    }
+
+    // Legacy single-letter controls (still work if you ever send them)
     const int FWD_FAST = 500;
     const int FWD_SLOW = 200;
     const int REV_FAST = -500;
     const int REV_SLOW = -200;
 
     if (msg == "F") {
-      // straight forward
       setMotorA(FWD_FAST);
       setMotorB(FWD_FAST);
       updateMotionLEDs(true);
     }
     else if (msg == "B") {
-      // straight backward
       setMotorA(REV_FAST);
       setMotorB(REV_FAST);
       updateMotionLEDs(true);
     }
     else if (msg == "L") {
-      // forward + curve left (left wheel slower)
       setMotorA(FWD_SLOW);
       setMotorB(FWD_FAST);
       updateMotionLEDs(true);
     }
     else if (msg == "R") {
-      // forward + curve right (right wheel slower)
       setMotorA(FWD_FAST);
       setMotorB(FWD_SLOW);
       updateMotionLEDs(true);
     }
     else if (msg == "S") {
       stopMotors();
+      updateMotionLEDs(false);
     }
   }
 }
 
-
 // ==========================================================
-//  Helper: IMU-based ~90 deg turn for tasks 2/3 (autonomous)
-//  dir = +1 => right, dir = -1 => left
+//  IMU-based ~90 deg turn (dir=+1 right, dir=-1 left)
 // ==========================================================
 void timedTurn(float dir) {
-  const float TARGET_DEG = 95.0f;                 // desired turn angle
-  const float TARGET_RAD = TARGET_DEG * 3.141592f / 180.0f;
-  const int   PWM_TURN   = 250;
+  const float TARGET_DEG = 90.0f;   // tweak to tighten corners
+  const int   PWM_TURN   = 200;
 
-  // reset IMU yaw integration (still useful if you want to log it)
-  resetIMUYaw();
-
-  // starting orientation from dead reckoning (radians)
-  float theta0 = odom.getTheta();
+  float yaw0 = getHeadingDeg();
 
   while (true) {
-    // update sensors / odometry
-    updateIMUYaw();
+    mpu.update();
     updateOdometryAndVelocity();
 
-    // current orientation in radians from odom
-    float theta = odom.getTheta();
+    float yaw  = getHeadingDeg();
+    float dyaw = angleDiffDeg(yaw, yaw0);
 
-    // smallest angular difference [-pi, pi]
-    float dtheta = theta - theta0;
-    while (dtheta >  3.141592f) dtheta -= 2.0f * 3.141592f;
-    while (dtheta < -3.141592f) dtheta += 2.0f * 3.141592f;
-    float dtheta_abs = fabs(dtheta);
-
-    // --- Stop condition ---
-    // primary: odom angle >= 90 deg
-    // secondary: IMU says we've turned enough
-    if (dtheta_abs >= TARGET_RAD /*|| imuYawDeg >= TARGET_DEG */) {
+    if (fabs(dyaw) >= TARGET_DEG) {
       break;
     }
 
-    // spin in place
-    int pwmA =  PWM_TURN * dir;   // left wheel
-    int pwmB = -PWM_TURN * dir;   // right wheel
-
+    int pwmA =  PWM_TURN * dir;
+    int pwmB = -PWM_TURN * dir;
     setMotorA(pwmA);
     setMotorB(pwmB);
     updateMotionLEDs(true);
@@ -578,73 +684,65 @@ void timedTurn(float dir) {
   }
 
   stopMotors();
+  updateMotionLEDs(false);
 }
 
 // ==========================================================
-//  Task 1 – Straight 80cm, show x,y,theta,v,w
-//  NOTE: with odom in cm, dist is also in cm; threshold 0.80f
-//  is now 0.8cm (you can change this to 80.0f if you want 80cm).
+//  Task 1 – Straight 80cm, show x,y,theta,v,w, send pose
 // ==========================================================
 void task1_run() {
   static bool init   = false;
   static long startA = 0;
   static long startB = 0;
 
-  // wheel / encoder parameters (same as Task 2)
-  const float TICKS_PER_REV = (float)(ticksPerRev * gearRatio); // 1440
-  const float WHEEL_RADIUS  = 0.6f;                             // cm
-  const float TARGET_DIST_CM = 80.0f;                           // 80 cm
+  const float TARGET_DIST_CM = 80.0f;
 
   if (!init) {
     encoderCountA = 0;
     encoderCountB = 0;
-    odom.setXLocation(0.0f);
-    odom.setYLocation(0.0f);
+    prevEncA = encoderCountA;
+    prevEncB = encoderCountB;
+
+    poseX_cm = 0.0f;
+    poseY_cm = 0.0f;
+    poseTh_deg = getHeadingDeg();
+    lastOdomMs = 0;
 
     startA = encoderCountA;
     startB = encoderCountB;
     init   = true;
   }
 
-  // --- distance along this straight segment from encoder ticks
   long dA = encoderCountA - startA;
   long dB = encoderCountB - startB;
 
-  // match sign convention from updateOdometryAndVelocity / Task 2:
-  // leftTicks  = -encoderCountA; rightTicks = encoderCountB;
   float leftTicks  = -(float)dA;
   float rightTicks =  (float)dB;
   float avgTicks   = 0.5f * (leftTicks + rightTicks);
 
-  float dist_cm = avgTicks * (2.0f * PI * WHEEL_RADIUS / TICKS_PER_REV);
+  float dist_cm = avgTicks * (2.0f * PI * WHEEL_RADIUS_CM / TICKS_PER_REV);
 
-  if (dist_cm < TARGET_DIST_CM) {
-    // drive straight forward, like Task 2
+  if (fabs(dist_cm) < TARGET_DIST_CM) {
     setMotorA(400);
     setMotorB(400);
     updateMotionLEDs(true);
 
-    float x  = odom.getXLocation();
-    float y  = odom.getYLocation();
-    float th = odom.getTheta();
-
-    String l1 = "T1 x=" + String(x, 2) + " y=" + String(y, 2);
-    String l2 = "th=" + String(th, 1) + " deg";
+    String l1 = "T1 x=" + String(poseX_cm, 2) + " y=" + String(poseY_cm, 2);
+    String l2 = "th=" + String(poseTh_deg, 1) + " deg";
     String l3 = "v=" + String(robotV, 2) + " w=" + String(robotW, 1);
     String msg[] = {l1, l2, l3};
     oledPrint(msg, 3);
-    sendPoseUDP(x, y, th);
+    sendPoseUDP(poseX_cm, poseY_cm, poseTh_deg);
   } else {
-    // reached 80 cm → stop and go idle
     stopMotors();
+    updateMotionLEDs(false);
     init = false;
     mode = IDLE;
   }
 }
 
 // ==========================================================
-//  Task 2 – Uni-direction 40cm square, show heading
-//  Uses encoder-based deltaS (cm) instead of distanceFrom()
+//  Task 2 – 40cm square forward (encoders + IMU turn)
 // ==========================================================
 void task2_run() {
   static bool init   = false;
@@ -652,11 +750,18 @@ void task2_run() {
   static long startA = 0;
   static long startB = 0;
 
+  const float SIDE_LEN_CM = 40.0f;
+
   if (!init) {
     encoderCountA = 0;
     encoderCountB = 0;
-    odom.setXLocation(0.0f);
-    odom.setYLocation(0.0f);
+    prevEncA = encoderCountA;
+    prevEncB = encoderCountB;
+
+    poseX_cm = 0.0f;
+    poseY_cm = 0.0f;
+    poseTh_deg = getHeadingDeg();
+    lastOdomMs = 0;
 
     side   = 0;
     startA = encoderCountA;
@@ -666,150 +771,143 @@ void task2_run() {
 
   if (side >= 4) {
     stopMotors();
+    updateMotionLEDs(false);
     init = false;
     mode = IDLE;
     return;
   }
 
-  // Distance along THIS side from encoder ticks
   long dA = encoderCountA - startA;
   long dB = encoderCountB - startB;
 
-  // match sign convention from updateOdometryAndVelocity:
-  // leftTicks  = -encoderCountA; rightTicks = encoderCountB;
   float leftTicks  = -(float)dA;
   float rightTicks =  (float)dB;
   float avgTicks   = 0.5f * (leftTicks + rightTicks);
 
-  const float TICKS_PER_REV = (float)(ticksPerRev * gearRatio); // 1440
-  const float WHEEL_RADIUS  = 0.6f;                             // cm
+  float dist_cm = avgTicks * (2.0f * PI * WHEEL_RADIUS_CM / TICKS_PER_REV);
 
-  // Same math as SimpleDeadReckoning: deltaS = avgTicks * (2πR / ticks_per_rev)
-  float dist_cm = avgTicks * (2.0f * 3.141592f * WHEEL_RADIUS / TICKS_PER_REV);
-
-  const float SIDE_LEN_CM = 40.0f;   // 40 cm side
-
-  if (dist_cm < SIDE_LEN_CM) {
+  if (fabs(dist_cm) < SIDE_LEN_CM) {
     setMotorA(350);
     setMotorB(350);
     updateMotionLEDs(true);
 
-    float th = odom.getTheta();  // deg
     String l1 = "T2 side " + String(side + 1);
-    String l2 = "theta=" + String(th, 1) + " deg";
+    String l2 = "th=" + String(poseTh_deg, 1) + " deg";
     String l3 = "d=" + String(dist_cm, 1) + " cm";
     String msg[] = {l1, l2, l3};
     oledPrint(msg, 3);
+    sendPoseUDP(poseX_cm, poseY_cm, poseTh_deg);
   } else {
     stopMotors();
+    updateMotionLEDs(false);
     delay(200);
-    timedTurn(-1.0f);   // IMU-based ~90° turn
+    timedTurn(-1.0f);   // turn left each corner
 
     startA = encoderCountA;
     startB = encoderCountB;
     side++;
+
+    resetHeadingPID(getHeadingDeg());
   }
 }
 
 // ==========================================================
 //  Task 3 – 40cm square forward, then 40cm square backward
-//  Uses same encoder math as Task 2, but drives both
-//  directions. Turns are skipped at the end of each square.
+//  Uses encoder distance + IMU heading PID + timedTurn
 // ==========================================================
 void task3_run() {
-  static bool init = false;
-  static int  side = 0;      // 0..3 forward, 4..7 backward
+  static bool init   = false;
+  static int  side   = 0;      // 0..3 fwd, 4..7 back
   static long startA = 0;
   static long startB = 0;
 
-  const float SIDE_LEN_CM    = 40.0f;      // 40 cm
-  const float WHEEL_RADIUS   = 0.6f;       // cm
-  const float TICKS_PER_REV  = (float)(ticksPerRev * gearRatio); // 1440
+  const float SIDE_LEN_CM   = 40.0f;
+  const int   BASE_PWM      = 350;
 
   if (!init) {
     encoderCountA = 0;
     encoderCountB = 0;
-    odom.setXLocation(0.0f);
-    odom.setYLocation(0.0f);
+    prevEncA = encoderCountA;
+    prevEncB = encoderCountB;
+
+    poseX_cm = 0.0f;
+    poseY_cm = 0.0f;
+    poseTh_deg = getHeadingDeg();
+    lastOdomMs = 0;
 
     side   = 0;
     startA = encoderCountA;
     startB = encoderCountB;
-    init   = true;
+
+    resetHeadingPID(getHeadingDeg());
+    init = true;
   }
 
-  // DONE AFTER 8 SIDES
   if (side >= 8) {
     stopMotors();
+    updateMotionLEDs(false);
     init = false;
     mode = IDLE;
     return;
   }
 
-  // First 4 sides = forward square, last 4 = backward square
   bool forward = (side < 4);
+  int  dirSign = forward ? +1 : -1;
 
-  // Encoder deltas since this side started
   long dA = encoderCountA - startA;
   long dB = encoderCountB - startB;
 
-  // Match same sign convention as Task 2
   float leftTicks  = -(float)dA;
   float rightTicks =  (float)dB;
   float avgTicks   = 0.5f * (leftTicks + rightTicks);
 
-  // Same deltaS formula as Task 2
-  float dist_cm = avgTicks * (2.0f * 3.141592f * WHEEL_RADIUS / TICKS_PER_REV);
+  float dist_cm = fabs(
+    avgTicks * (2.0f * PI * WHEEL_RADIUS_CM / TICKS_PER_REV)
+  );
 
-  // ==========================================================
-  // DRIVE FORWARD OR BACKWARD
-  // ==========================================================
-  if (fabs(dist_cm) < SIDE_LEN_CM) {
+  if (dist_cm < SIDE_LEN_CM) {
+    int base = BASE_PWM * dirSign;
 
-    int pwm = forward ? 350 : -350;   // same mag, sign flips direction
+    if (forward) {
+      // forward legs (0..3): use the original heading PID
+      headingHoldStep(base);
+    } else {
+      // reverse legs (4..7): use reverse-aware PID
+      headingHoldStepReverse(base);
+    }
 
-    setMotorA(pwm);
-    setMotorB(pwm);
     updateMotionLEDs(true);
 
-    String l1 = "T3 side " + String((side % 4) + 1) + (forward ? " F" : " B");
-    String l2 = "d=" + String(dist_cm, 1) + " cm";
-    String msg[] = { l1, l2 };
-    oledPrint(msg, 2);
+    String l1 = forward ? "T3 Fwd square" : "T3 Back square";
+    String l2 = "Side " + String((side % 4) + 1) + " d=" + String(dist_cm, 1) + "cm";
+    String l3 = "head=" + String(poseTh_deg, 1);
+    String msg[] = { l1, l2, l3 };
+    oledPrint(msg, 3);
 
-  } else {
-    // Finished this side
-    stopMotors();
-    delay(200);
-
-    // Decide whether we should turn here:
-    //  - Forward square: turn after sides 0,1,2 (NOT 3)
-    //  - Backward square: turn after sides 4,5,6 (NOT 7)
-    bool needTurn = false;
-    if (side < 3) {
-      // sides 0,1,2  (forward)
-      needTurn = true;
-    } else if (side >= 4 && side < 7) {
-      // sides 4,5,6  (backward)
-      needTurn = true;
-    }
-
-    if (needTurn) {
-      // Task 2 used timedTurn(-1.0f) for the correct 90° direction.
-      // Keep that for forward, reverse it for backward.
-      float dir = forward ? -1.0f : +1.0f;
-      timedTurn(dir);
-    }
-
-    // Reset encoder baselines for next side
-    startA = encoderCountA;
-    startB = encoderCountB;
-    side++;
+    sendPoseUDP(poseX_cm, poseY_cm, poseTh_deg);
+    return;
   }
+
+  // end of this leg
+  stopMotors();
+  updateMotionLEDs(false);
+  delay(200);
+
+  bool needTurn = false;
+  if (side < 3)                  needTurn = true; // forward 3 corners
+  else if (side > 3 && side < 7) needTurn = true; // backward 3 corners
+
+  if (needTurn) {
+    float turnDir = forward ? -1.0f : +1.0f;  // same pattern as before
+    timedTurn(turnDir);
+  }
+
+  startA = encoderCountA;
+  startB = encoderCountB;
+  side++;
+
+  resetHeadingPID(getHeadingDeg());
 }
-
-
-
 
 // ==========================================================
 //  Task 4 – Line-follow square, OLED: x,y
@@ -822,26 +920,32 @@ void task4_run() {
   if (!init) {
     encoderCountA = 0;
     encoderCountB = 0;
-    odom.setXLocation(0.0f);
-    odom.setYLocation(0.0f);
-    sx = 0.0f;
-    sy = 0.0f;
+    prevEncA = encoderCountA;
+    prevEncB = encoderCountB;
+
+    poseX_cm = 0.0f;
+    poseY_cm = 0.0f;
+    poseTh_deg = getHeadingDeg();
+    lastOdomMs = 0;
+
+    sx = poseX_cm;
+    sy = poseY_cm;
     startMs = millis();
     init = true;
   }
 
   lineFollowStep();
-  float x = odom.getXLocation();
-  float y = odom.getYLocation();
+
   String msg[] = {
     "T4 LineFollow",
-    "X=" + String(x, 2),
-    "Y=" + String(y, 2)
+    "X=" + String(poseX_cm, 2),
+    "Y=" + String(poseY_cm, 2)
   };
   oledPrint(msg, 3);
 
   if (distanceFrom(sx, sy) < 0.10f && robotV < 0.02f && millis() - startMs > 5000) {
     stopMotors();
+    updateMotionLEDs(false);
     init = false;
     mode = IDLE;
   }
@@ -858,68 +962,68 @@ void task5_run() {
   if (!init) {
     encoderCountA = 0;
     encoderCountB = 0;
-    odom.setXLocation(0.0f);
-    odom.setYLocation(0.0f);
-    sx = 0.0f;
-    sy = 0.0f;
+    prevEncA = encoderCountA;
+    prevEncB = encoderCountB;
+
+    poseX_cm = 0.0f;
+    poseY_cm = 0.0f;
+    poseTh_deg = getHeadingDeg();
+    lastOdomMs = 0;
+
+    sx = poseX_cm;
+    sy = poseY_cm;
     startMs = millis();
     init = true;
   }
 
+  // *** EXACT SAME BEHAVIOR AS T4 ***
   lineFollowStep();
-  float x = odom.getXLocation();
-  float y = odom.getYLocation();
-  float th = odom.getTheta();
 
   String msg[] = {
-    "T5 Line+PC",
-    "X=" + String(x,2),
-    "Y=" + String(y,2)
+    "T5 Line+PC",                     // only the title is different
+    "X=" + String(poseX_cm, 2),
+    "Y=" + String(poseY_cm, 2)
   };
   oledPrint(msg, 3);
-  sendPoseUDP(x, y, th);
+
+  // *** EXTRA: send pose like Q3 ***
+  sendPoseUDP(poseX_cm, poseY_cm, poseTh_deg);
 
   if (distanceFrom(sx, sy) < 0.10f && robotV < 0.02f && millis() - startMs > 5000) {
     stopMotors();
+    updateMotionLEDs(false);
     init = false;
     mode = IDLE;
   }
 }
 
 // ==========================================================
-//  Task 6 – Manual letters (Z,U,O,P,S,D,G,N,M)
+//  Task 6 – Manual letters (Z,U,O,P,S,D,G,N,M) + pose
 // ==========================================================
 void task6_run() {
-  float x = odom.getXLocation();
-  float y = odom.getYLocation();
-  float th = odom.getTheta();
-  sendPoseUDP(x, y, th);
-
-  String msg7[] = {"T6 Manual", "CMD:" + lastCmd, "PC:" + pcIP.toString()};
-  oledPrint(msg7, 3);
+  sendPoseUDP(poseX_cm, poseY_cm, poseTh_deg);
+  String msg[] = {"T6 Manual", "CMD:" + lastCmd, "PC:" + pcIP.toString()};
+  oledPrint(msg, 3);
 }
 
 // ==========================================================
 //  Task 7 – Manual + lidar OGM
 // ==========================================================
 void task7_run() {
-  float x = odom.getXLocation();
-  float y = odom.getYLocation();
-  float th = odom.getTheta();
-  sendPoseUDP(x, y, th);
+  sendPoseUDP(poseX_cm, poseY_cm, poseTh_deg);
 
   VL53L0X_RangingMeasurementData_t measure;
   lox.rangingTest(&measure, false);
   if (measure.RangeStatus == 0) {
-    float r = measure.RangeMilliMeter / 1000.0f;
-    float thRad = th * PI / 180.0f;
-    float xw = x + r * cosf(thRad);
-    float yw = y + r * sinf(thRad);
+    float r_cm  = measure.RangeMilliMeter / 10.0f;   // mm -> cm
+    float thRad = poseTh_deg * PI / 180.0f;
+    float xw = poseX_cm + r_cm * cosf(thRad);
+    float yw = poseY_cm + r_cm * sinf(thRad);
     sendLidarUDP(xw, yw);
   }
 
-  String msg8[] = {"T7 OGM", "CMD:" + lastCmd, "PC:" + pcIP.toString()};
-  oledPrint(msg8, 3);
+  String msg[] = {"T7 OGM", "CMD:" + lastCmd, "PC:" + pcIP.toString()};
+  oledPrint(msg, 3);
 }
 
 // ==========================================================
@@ -948,12 +1052,8 @@ void setup() {
 
   // Fast ADC configuration for IR sensors
   adc1_config_width(ADC_WIDTH_12Bit);
-
-  // TODO: make sure these channels match your wiring.
-  // Example from prof:
   adc1_config_channel_atten(ADC1_CHANNEL_1, ADC_ATTEN_DB_12);  // right IR
   adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_DB_12);  // left IR
-
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
 
@@ -979,8 +1079,8 @@ void setup() {
   String msg2[] = {"WiFi OK", WiFi.localIP().toString(), "UDP:9000"};
   oledPrint(msg2, 3);
 
-  imu.initialize();
-  calibrateGyroZ();   // IMU bias at rest
+  initIMU();
+  mpu.update();  // prime angles
 
   if (!lox.begin()) {
     String msg3[] = {"Lidar FAIL", "", ""};
@@ -992,8 +1092,13 @@ void setup() {
 
   encoderCountA = 0;
   encoderCountB = 0;
-  odom.setXLocation(0.0f);
-  odom.setYLocation(0.0f);
+  prevEncA = encoderCountA;
+  prevEncB = encoderCountB;
+
+  poseX_cm   = 0.0f;
+  poseY_cm   = 0.0f;
+  poseTh_deg = getHeadingDeg();
+  lastOdomMs = 0;
 }
 
 // ==========================================================
@@ -1001,6 +1106,7 @@ void setup() {
 // ==========================================================
 void loop() {
   handleNetwork();
+  mpu.update();
   updateOdometryAndVelocity();
 
   switch (mode) {
@@ -1012,11 +1118,13 @@ void loop() {
     case TASK6: task6_run(); break;
     case TASK7: task7_run(); break;
     case IDLE:
-    default:
+    default: {
       stopMotors();
-      String msg5[] = {"IDLE", "Send 1-7 via UDP", "\n", WiFi.localIP().toString(), "UDP:9000"};
-      oledPrint(msg5, 5);
+      updateMotionLEDs(false);
+      String msg[] = {"IDLE", "Send 1-7 via UDP", WiFi.localIP().toString(), "UDP:9000"};
+      oledPrint(msg, 4);
       break;
+    }
   }
 
   delay(10);

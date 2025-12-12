@@ -26,7 +26,14 @@ ROBOT_IP = "192.168.0.83"  # <-- change if robot IP changes
 ROBOT_PORT = 9000
 
 WORLD_RADIUS = 100   # cm
-GRID_RES = 5      # cm
+GRID_RES = 5         # cm
+
+# Manual drive PWM settings (tune these to taste)
+FWD_FAST = 500   # forward full speed
+FWD_SLOW = 250   # forward slower wheel for arcs
+REV_FAST = -500  # reverse full speed
+REV_SLOW = -250  # reverse slower wheel for arcs
+TURN_SPEED = 500 # pivot speed (left/right in place)
 
 
 # ==========================
@@ -45,6 +52,11 @@ path_y = []
 heatmap_counts = defaultdict(int)
 
 running = True
+
+# control state
+manual_mode = False           # True only when Task 6 is selected
+pressed_move_keys = set()     # current set of held movement keys: {"W","A","S","D","B"}
+last_pwm = (0, 0)             # last (left, right) PWM we sent
 
 
 # ==========================
@@ -74,6 +86,110 @@ def send_command(cmd: str):
     except OSError:
         # socket may be closed during shutdown
         pass
+
+
+def send_pwm(left: int, right: int):
+    """Send wheel PWM command as M,left,right (for manual drive)."""
+    global last_pwm
+    if (left, right) == last_pwm:
+        return
+    last_pwm = (left, right)
+    cmd = f"M,{left},{right}"
+    send_command(cmd)
+
+
+def stop_robot():
+    """Send a stop command (zero PWM + optional 'S')."""
+    global last_pwm
+    last_pwm = (0, 0)
+    # main stop: zero wheel command
+    send_pwm(0, 0)
+    # also send legacy 'S' in case robot still listens for it
+    send_command("S")
+
+
+def compute_pwm_from_keys(keys: set[str]) -> tuple[int, int]:
+    """
+    Decide (leftPWM, rightPWM) based on which movement keys are held.
+
+    Movement keys (only active when Task 6 selected):
+      W = forward
+      B = backward
+      A = pivot/arc left
+      D = pivot/arc right
+
+    Combos:
+      W + D -> forward-right arc
+      W + A -> forward-left arc
+      B + D -> backward-right arc
+      B + A -> backward-left arc
+
+    Singles:
+      {W}       -> straight forward
+      {B}       -> straight backward
+      {A}       -> pivot left (in place)
+      {D}       -> pivot right (in place)
+
+    S is handled separately as an immediate stop, not as a held movement key.
+    """
+    # Normalize to just the movement keys we care about
+    forward = "W" in keys
+    back    = "B" in keys
+    left    = "A" in keys
+    right   = "D" in keys
+
+    # No meaningful movement keys -> stop
+    if not (forward or back or left or right):
+        return 0, 0
+
+    # If both forward and back somehow held, neutral
+    if forward and back:
+        return 0, 0
+
+    # Forward cases
+    if forward:
+        # Arcs
+        if right and not left:
+            # forward-right arc: left faster than right
+            return FWD_FAST, FWD_SLOW
+        if left and not right:
+            # forward-left arc: right faster than left
+            return FWD_SLOW, FWD_FAST
+        # Straight forward (W, or W+A+D → treat as straight)
+        return FWD_FAST, FWD_FAST
+
+    # Backward cases
+    if back:
+        if right and not left:
+            # backward-right arc
+            return REV_FAST, REV_SLOW
+        if left and not right:
+            # backward-left arc
+            return REV_SLOW, REV_FAST
+        # Straight backward
+        return REV_FAST, REV_FAST
+
+    # No forward/back, maybe pivots
+    if left and not right:
+        # pivot left: left backward, right forward
+        return -TURN_SPEED, TURN_SPEED
+    if right and not left:
+        # pivot right: left forward, right backward
+        return TURN_SPEED, -TURN_SPEED
+
+    # Both A and D but no W/B: treat as stop
+    return 0, 0
+
+
+def update_motion():
+    """Recompute PWM from pressed_move_keys and send it (only in manual mode)."""
+    if not manual_mode:
+        return
+    left, right = compute_pwm_from_keys(pressed_move_keys)
+    if left == 0 and right == 0:
+        stop_robot()
+    else:
+        send_pwm(left, right)
 
 
 # ==========================
@@ -132,21 +248,37 @@ def telemetry_thread():
 # Keyboard listener (pynput)
 # ==========================
 
+MOVE_KEYS = {"W", "A", "D", "B"}  # movement keys; S is stop only
+
+
 def on_press(key):
     """
     Global key handler using pynput.
 
-    Controls:
+    MENU:
       1-7 : select Task 1..7 on robot
-      W   : forward
-      S   : stop
-      B   : backward / reverse
-      A   : turn left
-      D   : turn right
-      Space : stop
+             (Task 6 = Manual Drive mode)
+
+    MANUAL DRIVE (only when Task 6 selected):
+      W   : forward   (hold)
+      B   : backward  (hold)
+      A   : left pivot / arc (hold)
+      D   : right pivot / arc (hold)
+
+      Combos:
+        W + D -> forward-right arc
+        W + A -> forward-left arc
+        B + D -> backward-right arc
+        B + A -> backward-left arc
+
+      Release all: STOP.
+
+    OTHER:
+      S     : immediate stop (any time)
+      Space : immediate stop (any time)
       Q or Esc : quit client
     """
-    global running
+    global running, manual_mode, pressed_move_keys
 
     # Letter / number keys
     try:
@@ -157,31 +289,78 @@ def on_press(key):
     except AttributeError:
         # Special keys (space, esc, etc.)
         if key == keyboard.Key.space:
-            send_command("S")   # stop
+            pressed_move_keys.clear()
+            stop_robot()
         elif key == keyboard.Key.esc:
             print("ESC pressed, quitting...")
             running = False
         return
 
+    # ---- Task selection menu ----
     if k in {"1", "2", "3", "4", "5", "6", "7"}:
-        send_command(k)
-    elif k == "W":
-        send_command("F")       # forward
-    elif k == "A":
-        send_command("L")       # left
-    elif k == "D":
-        send_command("R")       # right
-    elif k == "B":
-        send_command("B")       # backward / reverse
-    elif k == "S":
-        send_command("S")       # stop
-    elif k == "Q":
+        send_command(k)  # tell robot which task to run
+
+        # Only Task 6 is manual mode
+        manual_mode = (k == "6" or k == "7")
+        pressed_move_keys.clear()
+        stop_robot()  # ensure robot is stopped on task switch
+
+        if manual_mode:
+            print("Manual Drive MODE (Task 6) ENABLED")
+        else:
+            print(f"Task {k} selected, Manual Drive DISABLED")
+        return
+
+    # Stop key (always available)
+    if k == "S":
+        pressed_move_keys.clear()
+        stop_robot()
+        return
+
+    # Quit shortcut
+    if k == "Q":
         print("Q pressed, quitting...")
         running = False
+        return
+
+    # ---- Manual drive keys only if Task 6 is selected ----
+    if not manual_mode:
+        if k in MOVE_KEYS:
+            print("Ignoring drive key (not in Task 6 / Manual Drive).")
+        return
+
+    # From here on: manual_mode == True
+    if k in MOVE_KEYS:
+        # If already held, ignore auto-repeat
+        if k not in pressed_move_keys:
+            pressed_move_keys.add(k)
+            update_motion()
+
+
+def on_release(key):
+    """Update motion / send stop when movement keys are released (only in manual mode)."""
+    global manual_mode, pressed_move_keys
+
+    if not manual_mode:
+        return
+
+    # Try to get character for letter keys
+    try:
+        k = key.char
+        if k is None:
+            return
+        k = k.upper()
+    except AttributeError:
+        return
+
+    if k in MOVE_KEYS:
+        if k in pressed_move_keys:
+            pressed_move_keys.discard(k)
+            update_motion()
 
 
 def start_keyboard_listener():
-    listener = keyboard.Listener(on_press=on_press)
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.daemon = True
     listener.start()
     return listener
@@ -199,14 +378,21 @@ def main():
     print(f"Robot IP   : {ROBOT_IP}")
     print(f"Robot Port : {ROBOT_PORT}")
     print()
-    print("Controls (global via pynput):")
+    print("MENU:")
     print("  1-7 : select Task 1..7 on robot")
-    print("  W   : forward")
-    print("  B   : backward / reverse")
-    print("  A   : turn left")
-    print("  D   : turn right")
-    print("  S   : stop")
-    print("  Space : stop")
+    print("        (Task 6 = Manual Drive mode)")
+    print()
+    print("MANUAL DRIVE CONTROLS (only active in Task 6):")
+    print("  W   : forward   (hold)")
+    print("  B   : backward  (hold)")
+    print("  A   : pivot left / arc left (hold)")
+    print("  D   : pivot right / arc right (hold)")
+    print("  Combos: W+D, W+A, B+D, B+A for arcs")
+    print("  Release all move keys: STOP")
+    print()
+    print("OTHER:")
+    print("  S     : STOP immediately")
+    print("  Space : STOP immediately")
     print("  Q or ESC : quit client")
     print()
 
@@ -226,8 +412,8 @@ def main():
     # Path plot
     path_line, = ax_path.plot([], [], "-")
     ax_path.set_title("Robot Path")
-    ax_path.set_xlabel("X (m)")
-    ax_path.set_ylabel("Y (m)")
+    ax_path.set_xlabel("X")
+    ax_path.set_ylabel("Y")
     ax_path.set_aspect("equal", "box")
     ax_path.set_xlim(-WORLD_RADIUS, WORLD_RADIUS)
     ax_path.set_ylim(-WORLD_RADIUS, WORLD_RADIUS)
@@ -244,8 +430,8 @@ def main():
         aspect="equal"
     )
     ax_map.set_title("Lidar Heatmap")
-    ax_map.set_xlabel("X (m)")
-    ax_map.set_ylabel("Y (m)")
+    ax_map.set_xlabel("X")
+    ax_map.set_ylabel("Y")
 
     plt.tight_layout()
 
